@@ -1,3 +1,4 @@
+// api/ai_search.js
 import fetch from 'node-fetch';
 import OpenAI from 'openai';
 import { GoogleGenerativeAI } from "@google/generative-ai";
@@ -7,10 +8,20 @@ const gemini = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
 
 export default async function handler(req, res) {
   try {
-    const { query } = req.body || {};
-    if (!query) return res.status(400).json({ error: "Query is required" });
+    // ✨ Detectar query: GET ?q= o POST JSON { "query": "..." }
+    const query = req.method === 'POST'
+      ? (await req.json()).query
+      : req.query.q;
 
-    // Shopify
+    if (!query) {
+      return res.status(400).json({ error: 'Query parameter "q" is required' });
+    }
+
+    if (!process.env.SHOPIFY_STORE || !process.env.SHOPIFY_ADMIN_TOKEN) {
+      return res.status(500).json({ error: 'Shopify credentials not configured' });
+    }
+
+    // 1️⃣ Buscar productos en Shopify
     const shopifyRes = await fetch(
       `https://${process.env.SHOPIFY_STORE}/admin/api/2024-10/products.json?title=${encodeURIComponent(query)}`,
       {
@@ -20,12 +31,13 @@ export default async function handler(req, res) {
         }
       }
     );
-    if (!shopifyRes.ok) {
-      const errText = await shopifyRes.text();
-      console.error("Error Shopify API:", errText);
-      return res.status(500).json({ error: "Error fetching data from Shopify" });
-    }
+
     const data = await shopifyRes.json();
+
+    if (data.errors) {
+      console.error("Error Shopify API:", data);
+      return res.status(500).json({ error: 'Error fetching data from Shopify' });
+    }
 
     const products = (data.products || []).map(p => ({
       title: p.title,
@@ -35,15 +47,14 @@ export default async function handler(req, res) {
       url: `https://${process.env.SHOPIFY_STORE}/products/${p.handle}`
     }));
 
-    // Google Gemini
+    // 2️⃣ Consultar contexto técnico con Gemini (Google)
     const model = gemini.getGenerativeModel({ model: "gemini-pro" });
     const googleResp = await model.generateContent(
-      `Busca en manuales, fichas técnicas o Google información sobre: ${query}. 
-       Devuelve un resumen breve y técnico en español.`
+      `Busca en manuales, fichas técnicas o Google información sobre: ${query}. Devuelve un resumen breve y técnico en español.`
     );
-    const techSummary = googleResp.output_text || googleResp.response?.text() || '';
+    const techSummary = googleResp.response.text();
 
-    // OpenAI
+    // 3️⃣ Combinar todo con OpenAI
     const aiResp = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
