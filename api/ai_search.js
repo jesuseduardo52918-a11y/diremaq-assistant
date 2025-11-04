@@ -1,90 +1,67 @@
-// /api/ai_search.js
 import fetch from 'node-fetch';
+import OpenAI from 'openai';
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
-const SHOPIFY_STORE_URL = process.env.SHOPIFY_STORE_URL;
-const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const gemini = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
 
 export default async function handler(req, res) {
   try {
-    const q = req.query.q?.trim() || '';
+    const { query } = req.body || {};
+    if (!query) return res.status(400).json({ error: "Query is required" });
 
-    if (!q) {
-      return res.status(400).json({ error: 'Query parameter "q" is required' });
-    }
-
-    if (!SHOPIFY_STORE_URL || !SHOPIFY_ACCESS_TOKEN) {
-      return res.status(500).json({ error: 'Shopify credentials not configured' });
-    }
-
-    // GraphQL query para buscar productos por título o descripción
-    const graphqlQuery = {
-      query: `
-        {
-          products(first: 5, query: "${q}") {
-            edges {
-              node {
-                id
-                title
-                description
-                variants(first: 1) {
-                  edges {
-                    node {
-                      sku
-                      price
-                    }
-                  }
-                }
-                images(first: 1) {
-                  edges {
-                    node {
-                      transformedSrc
-                    }
-                  }
-                }
-              }
-            }
-          }
+    // Shopify
+    const shopifyRes = await fetch(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2024-10/products.json?title=${encodeURIComponent(query)}`,
+      {
+        headers: {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          "Content-Type": "application/json"
         }
-      `
-    };
-
-    // Llamada al Admin API de Shopify
-    const response = await fetch(`${SHOPIFY_STORE_URL}/admin/api/2023-10/graphql.json`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN
-      },
-      body: JSON.stringify(graphqlQuery)
-    });
-
-    const data = await response.json();
-
-    if (data.errors) {
-      console.error('Error Shopify API:', data.errors);
-      return res.status(500).json({ error: 'Error fetching data from Shopify' });
+      }
+    );
+    if (!shopifyRes.ok) {
+      const errText = await shopifyRes.text();
+      console.error("Error Shopify API:", errText);
+      return res.status(500).json({ error: "Error fetching data from Shopify" });
     }
+    const data = await shopifyRes.json();
 
-    const products = data.data.products.edges.map(edge => {
-      const node = edge.node;
-      return {
-        title: node.title,
-        description: node.description,
-        sku: node.variants.edges[0]?.node.sku || '',
-        price: node.variants.edges[0]?.node.price || '',
-        image: node.images.edges[0]?.node.transformedSrc || ''
-      };
+    const products = (data.products || []).map(p => ({
+      title: p.title,
+      sku: p.variants?.[0]?.sku || '',
+      price: `$${p.variants?.[0]?.price || '0.00'}`,
+      image: p.image?.src || '',
+      url: `https://${process.env.SHOPIFY_STORE}/products/${p.handle}`
+    }));
+
+    // Google Gemini
+    const model = gemini.getGenerativeModel({ model: "gemini-pro" });
+    const googleResp = await model.generateContent(
+      `Busca en manuales, fichas técnicas o Google información sobre: ${query}. 
+       Devuelve un resumen breve y técnico en español.`
+    );
+    const techSummary = googleResp.output_text || googleResp.response?.text() || '';
+
+    // OpenAI
+    const aiResp = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "Eres un asistente técnico experto en refacciones Diremaq." },
+        { role: "user", content: `Consulta: ${query}\nResumen técnico: ${techSummary}\nProductos encontrados: ${products.map(p=>p.title).join(', ')}` }
+      ]
     });
 
-    // Respuesta para tu chat embebido
-    const answer = products.length
-      ? `Encontré ${products.length} productos relacionados con "${q}".`
-      : 'No encontré productos exactos. ¿Puedes dar más detalles?';
+    const answer = aiResp.choices[0].message.content;
 
-    res.status(200).json({ answer, results: products, found: products.length > 0 });
+    res.status(200).json({
+      answer,
+      results: products,
+      found: !!products.length
+    });
 
   } catch (err) {
-    console.error('Error en /api/ai_search:', err);
-    res.status(500).json({ error: 'Error interno del servidor' });
+    console.error(err);
+    res.status(500).json({ answer: "Error interno del asistente.", results: [], found: false });
   }
 }
